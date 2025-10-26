@@ -1,0 +1,3 @@
+[submodule "vendor/kwatcher"]
+	path = vendor/kwatcher
+	url = https://git.kalelzar.xyz/kalelzar/kwatcher.git
