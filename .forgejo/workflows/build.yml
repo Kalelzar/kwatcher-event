@@ -1,0 +1,34 @@
+name: Build and Test
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  build:
+    runs-on: docker
+    strategy:
+      fail-fast: false
+      matrix:
+        targets:
+          - aarch64-linux-gnu
+          - x86_64-linux-gnu
+          - x86_64-windows
+    container:
+      image: git.kalelzar.xyz/kalelzar/kwatcher-build:0.3-alpine-25.5
+      credentials:
+        username: ${{secrets.USER}}
+        password: ${{secrets.TOKEN}}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{secrets.FETCH_TOKEN}}
+      - name: Get Zig
+        uses: https://github.com/mlugg/setup-zig@v2
+        with:
+          cache-key: ${{ matrix.targets }}
+      - name: Check
+        run: zig build check --summary all -Dtarget=${{matrix.targets}} -freference-trace=25
+      - name: Test
+        run: zig build test --summary all
+
