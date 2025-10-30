@@ -80,19 +80,67 @@ pub fn types(self: *KEventRepo, allocator: std.mem.Allocator) !std.ArrayList([]c
 }
 
 pub fn get(self: *KEventRepo, allocator: std.mem.Allocator, eq: models.PaginatedEventsQuery) !std.ArrayListUnmanaged(KEventRow) {
-    const query =
-        if (eq.event_types != null and !std.mem.eql(u8, eq.event_types.?, "All"))
-            \\ select * from kevent
-            \\    where event_type = $3
-            \\    order by end_time DESC
-            \\    limit $2
-            \\    offset $1;
-        else
-            \\ select * from kevent
-            \\    order by end_time DESC
-            \\    limit $2
-            \\    offset $1;       
-        ;
+    var writer = std.io.Writer.Allocating.init(allocator);
+    const wi = &writer.writer;
+
+    const base_query = "select e.* from kevent e";
+    const base_end =
+        \\    order by e.end_time DESC
+        \\    limit $2
+        \\    offset $1;
+    ;
+
+    try wi.writeAll(base_query);
+    const hasEventTypeFilter = eq.event_types != null and !std.mem.eql(u8, eq.event_types.?, "All");
+    const hasClientFilter = eq.clients != null and !std.mem.eql(u8, eq.clients.?, "All");
+    const hasHostFilter = eq.hosts != null and !std.mem.eql(u8, eq.hosts.?, "All");
+    if (hasClientFilter or hasHostFilter) {
+        try wi.writeAll(" join kclient c ON e.kclient = c.id ");
+    }
+
+    var startedFilter = false;
+    var filterIndex: u8 = 3;
+
+    if (hasEventTypeFilter) {
+        if (startedFilter) {
+            try wi.writeAll(" and ");
+        } else {
+            try wi.writeAll(" where ");
+            startedFilter = true;
+        }
+        try wi.writeAll("e.event_type = $");
+        try wi.writeAll(&std.fmt.digits2(filterIndex));
+        filterIndex += 1;
+    }
+
+    if (hasClientFilter) {
+        if (startedFilter) {
+            try wi.writeAll(" and ");
+        } else {
+            try wi.writeAll(" where ");
+            startedFilter = true;
+        }
+        try wi.writeAll("c.kname = $");
+        try wi.writeAll(&std.fmt.digits2(filterIndex));
+        filterIndex += 1;
+    }
+
+    if (hasHostFilter) {
+        if (startedFilter) {
+            try wi.writeAll(" and ");
+        } else {
+            try wi.writeAll(" where ");
+            startedFilter = true;
+        }
+        try wi.writeAll("c.host = $");
+        try wi.writeAll(&std.fmt.digits2(filterIndex));
+        filterIndex += 1;
+    }
+
+    try wi.writeAll(base_end);
+    try wi.flush();
+    const query = try writer.toOwnedSlice();
+    defer allocator.free(query);
 
     var stmt = try pg.Stmt.init(self.conn, .{ .allocator = allocator, .column_names = true });
     errdefer stmt.deinit();
@@ -101,11 +149,65 @@ pub fn get(self: *KEventRepo, allocator: std.mem.Allocator, eq: models.Paginated
     try stmt.bind(eq.drop);
     try stmt.bind(eq.take);
 
-    if (eq.event_types != null and !std.mem.eql(u8, eq.event_types.?, "All")) {
+    if (hasEventTypeFilter) {
         try stmt.bind(eq.event_types.?);
     }
 
+    if (hasClientFilter) {
+        try stmt.bind(eq.clients.?);
+    }
+
+    if (hasHostFilter) {
+        try stmt.bind(eq.hosts.?);
+    }
+
     const result = stmt.execute() catch |e| switch (e) {
+        error.PG => {
+            if (self.conn.err) |pge| {
+                log.err(
+                    "[{s}] Encountered an error ({s}) while retrieving a client: \n{s}\n",
+                    .{ pge.severity, pge.code, pge.message },
+                );
+            } else {
+                log.err("Encountered an unknown error while retrieving a client.\n", .{});
+            }
+            return e;
+        },
+        else => return e,
+    };
+    defer result.deinit();
+
+    var arr = try std.ArrayListUnmanaged(KEventRow).initCapacity(allocator, result.number_of_columns);
+
+    while (try result.next()) |row| {
+        const data = try row.to(KEventRow, .{ .map = .name, .allocator = allocator });
+        try arr.append(
+            allocator,
+            data,
+        );
+    }
+
+    return arr;
+}
+
+pub fn getRecent(self: *KEventRepo, allocator: std.mem.Allocator) !std.ArrayListUnmanaged(KEventRow) {
+    const query =
+        \\ select distinct on (kclient, user_id) * from kevent
+        \\    where end_time >= $1
+        \\    order by kclient, user_id, end_time DESC;
+    ;
+
+    const recency = std.time.us_per_min * 5;
+    const now = std.time.microTimestamp() - recency;
+
+    const result = self.conn.queryOpts(
+        query,
+        .{now},
+        .{
+            .allocator = allocator,
+            .column_names = true,
+        },
+    ) catch |e| switch (e) {
         error.PG => {
             if (self.conn.err) |pge| {
                 log.err(
