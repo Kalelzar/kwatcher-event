@@ -5,7 +5,7 @@ const uuid = @import("uuid");
 const kwatcher = @import("kwatcher");
 const KClient = @import("kclient.zig");
 const json = @import("../json.zig");
-const Cursor = @import("../models/query.zig");
+const models = @import("../models.zig");
 
 const KEventRepo = @This();
 
@@ -43,22 +43,69 @@ pub const FromPool = struct {
 pub fn deinit(self: *KEventRepo) void {
     self.conn.release();
 }
-pub fn get(self: *KEventRepo, allocator: std.mem.Allocator, cursor: Cursor) !std.ArrayListUnmanaged(KEventRow) {
+
+pub fn types(self: *KEventRepo, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
     const query =
-        \\ select * from kevent
-        \\    order by end_time DESC
-        \\    limit $2
-        \\    offset $1;
+        \\ select distinct event_type from kevent
+        \\    order by event_type;
     ;
 
     const result = self.conn.queryOpts(
         query,
-        .{ cursor.drop, cursor.take },
-        .{
-            .column_names = true,
-            .allocator = allocator,
-        },
+        .{},
+        .{ .allocator = allocator },
     ) catch |e| switch (e) {
+        error.PG => {
+            if (self.conn.err) |pge| {
+                log.err(
+                    "[{s}] Encountered an error ({s}) while retrieving event types: \n{s}\n",
+                    .{ pge.severity, pge.code, pge.message },
+                );
+            } else {
+                log.err("Encountered an unknown error while retrieving event types.\n", .{});
+            }
+            return e;
+        },
+        else => return e,
+    };
+    defer result.deinit();
+
+    var event_t = try std.ArrayList([]const u8).initCapacity(allocator, result._values.len);
+
+    while (try result.next()) |row| {
+        try event_t.append(allocator, row.get([]const u8, 0));
+    }
+
+    return event_t;
+}
+
+pub fn get(self: *KEventRepo, allocator: std.mem.Allocator, eq: models.PaginatedEventsQuery) !std.ArrayListUnmanaged(KEventRow) {
+    const query =
+        if (eq.event_types != null and !std.mem.eql(u8, eq.event_types.?, "All"))
+            \\ select * from kevent
+            \\    where event_type = $3
+            \\    order by end_time DESC
+            \\    limit $2
+            \\    offset $1;
+        else
+            \\ select * from kevent
+            \\    order by end_time DESC
+            \\    limit $2
+            \\    offset $1;       
+        ;
+
+    var stmt = try pg.Stmt.init(self.conn, .{ .allocator = allocator, .column_names = true });
+    errdefer stmt.deinit();
+
+    try stmt.prepare(query, null);
+    try stmt.bind(eq.drop);
+    try stmt.bind(eq.take);
+
+    if (eq.event_types != null and !std.mem.eql(u8, eq.event_types.?, "All")) {
+        try stmt.bind(eq.event_types.?);
+    }
+
+    const result = stmt.execute() catch |e| switch (e) {
         error.PG => {
             if (self.conn.err) |pge| {
                 log.err(

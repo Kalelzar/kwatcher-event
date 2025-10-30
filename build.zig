@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) !void {
         .dump = false,
     });
     const kwatcher = kw.module("kwatcher");
+    const klib = kw.builder.dependency("klib", .{ .target = target, .optimize = optimize }).module("klib");
     // 3rd Party:
     const pg = b.dependency("pg", .{ .target = target, .optimize = optimize }).module("pg");
     const uuid = kw.builder.dependency("uuid", .{ .target = target, .optimize = optimize }).module("uuid");
@@ -79,6 +80,7 @@ pub fn build(b: *std.Build) !void {
     // Internal:
     // 1st Party:
     kwatcher_event_library.addImport("kwatcher", kwatcher);
+    kwatcher_event_library.addImport("klib", klib);
     // 3rd Party:
     kwatcher_event_library.addImport("pg", pg);
     kwatcher_event_library.addImport("uuid", uuid);
