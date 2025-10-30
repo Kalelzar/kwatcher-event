@@ -25,6 +25,19 @@ pub fn deinit(self: *KClientRepo) void {
     self.conn.release();
 }
 
+pub const FromPool = struct {
+    pool: *pg.Pool,
+    pub fn init(pool: *pg.Pool) !FromPool {
+        return .{
+            .pool = pool,
+        };
+    }
+
+    pub fn yield(self: *FromPool) !KClientRepo {
+        return .init(self.pool);
+    }
+};
+
 pub fn getOrCreate(self: *KClientRepo, arena: *kwatcher.mem.InternalArena, client: kwatcher.schema.ClientInfo, user: kwatcher.schema.UserInfo) !KClientRow {
     const alloc = arena.allocator();
     const row = self.conn.rowOpts(
@@ -70,4 +83,64 @@ pub fn getOrCreate(self: *KClientRepo, arena: *kwatcher.mem.InternalArena, clien
             .host = user.hostname,
         };
     }
+}
+
+pub fn getClients(self: *KClientRepo, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
+    const result = self.conn.queryOpts(
+        "select distinct kname from kclient order by kname",
+        .{},
+        .{ .allocator = allocator },
+    ) catch |e| switch (e) {
+        error.PG => {
+            if (self.conn.err) |pge| {
+                log.err(
+                    "[{s}] Encountered an error ({s}) while retrieving a client: \n{s}\n",
+                    .{ pge.severity, pge.code, pge.message },
+                );
+            } else {
+                log.err("Encountered an unknown error while retrieving a client.\n", .{});
+            }
+            return e;
+        },
+        else => return e,
+    };
+    defer result.deinit();
+
+    var clients = try std.ArrayList([]const u8).initCapacity(allocator, result._values.len);
+
+    while (try result.next()) |row| {
+        try clients.append(allocator, row.get([]const u8, 0));
+    }
+
+    return clients;
+}
+
+pub fn getHosts(self: *KClientRepo, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
+    const result = self.conn.queryOpts(
+        "select distinct host from kclient order by host",
+        .{},
+        .{ .allocator = allocator },
+    ) catch |e| switch (e) {
+        error.PG => {
+            if (self.conn.err) |pge| {
+                log.err(
+                    "[{s}] Encountered an error ({s}) while retrieving a client: \n{s}\n",
+                    .{ pge.severity, pge.code, pge.message },
+                );
+            } else {
+                log.err("Encountered an unknown error while retrieving a client.\n", .{});
+            }
+            return e;
+        },
+        else => return e,
+    };
+    defer result.deinit();
+
+    var clients = try std.ArrayList([]const u8).initCapacity(allocator, result._values.len);
+
+    while (try result.next()) |row| {
+        try clients.append(allocator, row.get([]const u8, 0));
+    }
+
+    return clients;
 }
