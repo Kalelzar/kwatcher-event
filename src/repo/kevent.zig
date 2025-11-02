@@ -21,6 +21,20 @@ pub const KEventRow = struct {
     properties: []const u8, // JSONB
 };
 
+pub const KEventWithClientRow = struct {
+    id: []const u8, // UUID
+    kclient: []const u8, // UUID FK(kclient)
+
+    user_id: []const u8, // TEXT
+    event_type: []const u8, // TEXT
+    start_time: i64, // TimestampTZ
+    end_time: i64, // TimestampTZ
+    properties: []const u8, // JSONB
+    client_name: []const u8, // TEXT
+    client_version: []const u8, // TEXT
+    client_host: []const u8, // TEXT
+};
+
 pub fn init(pool: *pg.Pool) !KEventRepo {
     return .{
         .conn = try pool.acquire(),
@@ -190,9 +204,14 @@ pub fn get(self: *KEventRepo, allocator: std.mem.Allocator, eq: models.Paginated
     return arr;
 }
 
-pub fn getRecent(self: *KEventRepo, allocator: std.mem.Allocator) !std.ArrayListUnmanaged(KEventRow) {
+pub fn getRecent(self: *KEventRepo, allocator: std.mem.Allocator) !std.ArrayListUnmanaged(KEventWithClientRow) {
     const query =
-        \\ select distinct on (kclient, user_id) * from kevent
+        \\ select distinct on (kclient, user_id) e.*,
+        \\    c.kname as client_name,
+        \\    c.kversion as client_version,
+        \\    c.host as client_host
+        \\    from kevent e
+        \\    join kclient c on c.id = e.kclient
         \\    where end_time >= $1
         \\    order by kclient, user_id, end_time DESC;
     ;
@@ -223,10 +242,10 @@ pub fn getRecent(self: *KEventRepo, allocator: std.mem.Allocator) !std.ArrayList
     };
     defer result.deinit();
 
-    var arr = try std.ArrayListUnmanaged(KEventRow).initCapacity(allocator, result.number_of_columns);
+    var arr = try std.ArrayListUnmanaged(KEventWithClientRow).initCapacity(allocator, result.number_of_columns);
 
     while (try result.next()) |row| {
-        const data = try row.to(KEventRow, .{ .map = .name, .allocator = allocator });
+        const data = try row.to(KEventWithClientRow, .{ .map = .name, .allocator = allocator });
         try arr.append(
             allocator,
             data,
