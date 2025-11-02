@@ -58,17 +58,56 @@ pub fn deinit(self: *KEventRepo) void {
     self.conn.release();
 }
 
-pub fn types(self: *KEventRepo, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
-    const query =
-        \\ select distinct event_type from kevent
-        \\    order by event_type;
-    ;
+pub fn types(self: *KEventRepo, allocator: std.mem.Allocator, eq: models.EventFilters) !std.ArrayList([]const u8) {
+    var writer = std.io.Writer.Allocating.init(allocator);
+    const wi = &writer.writer;
 
-    const result = self.conn.queryOpts(
-        query,
-        .{},
+    const base_query = "select distinct event_type from kevent e ";
+    const base_end = " order by event_type;";
+
+    const qq: models.PaginatedEventsQuery = .{
+        .drop = 0,
+        .take = 0,
+        .event_types = null,
+        .clients = eq.clients,
+        .hosts = eq.hosts,
+    };
+
+    try buildEventFilterQuery(
+        wi,
+        qq,
+        base_query,
+        base_end,
+        1,
+    );
+
+    const query = try writer.toOwnedSlice();
+    defer allocator.free(query);
+
+    var stmt = try pg.Stmt.init(
+        self.conn,
         .{ .allocator = allocator },
-    ) catch |e| switch (e) {
+    );
+    errdefer stmt.deinit();
+
+    stmt.prepare(query, null) catch |e| switch (e) {
+        error.PG => {
+            if (self.conn.err) |pge| {
+                log.err(
+                    "[{s}] Encountered an error ({s}) while preparing event types query: \n{s}\n",
+                    .{ pge.severity, pge.code, pge.message },
+                );
+            } else {
+                log.err("Encountered an unknown error while preparing event types query.\n", .{});
+            }
+            return e;
+        },
+        else => return e,
+    };
+
+    try bindEventFilterQueryParams(&stmt, qq);
+
+    const result = stmt.execute() catch |e| switch (e) {
         error.PG => {
             if (self.conn.err) |pge| {
                 log.err(
@@ -93,75 +132,10 @@ pub fn types(self: *KEventRepo, allocator: std.mem.Allocator) !std.ArrayList([]c
     return event_t;
 }
 
-pub fn get(self: *KEventRepo, allocator: std.mem.Allocator, eq: models.PaginatedEventsQuery) !std.ArrayListUnmanaged(KEventRow) {
-    var writer = std.io.Writer.Allocating.init(allocator);
-    const wi = &writer.writer;
-
-    const base_query = "select e.* from kevent e";
-    const base_end =
-        \\    order by e.end_time DESC
-        \\    limit $2
-        \\    offset $1;
-    ;
-
-    try wi.writeAll(base_query);
+fn bindEventFilterQueryParams(stmt: *pg.Stmt, eq: models.PaginatedEventsQuery) !void {
     const hasEventTypeFilter = eq.event_types != null and !std.mem.eql(u8, eq.event_types.?, "All");
     const hasClientFilter = eq.clients != null and !std.mem.eql(u8, eq.clients.?, "All");
     const hasHostFilter = eq.hosts != null and !std.mem.eql(u8, eq.hosts.?, "All");
-    if (hasClientFilter or hasHostFilter) {
-        try wi.writeAll(" join kclient c ON e.kclient = c.id ");
-    }
-
-    var startedFilter = false;
-    var filterIndex: u8 = 3;
-
-    if (hasEventTypeFilter) {
-        if (startedFilter) {
-            try wi.writeAll(" and ");
-        } else {
-            try wi.writeAll(" where ");
-            startedFilter = true;
-        }
-        try wi.writeAll("e.event_type = $");
-        try wi.writeAll(&std.fmt.digits2(filterIndex));
-        filterIndex += 1;
-    }
-
-    if (hasClientFilter) {
-        if (startedFilter) {
-            try wi.writeAll(" and ");
-        } else {
-            try wi.writeAll(" where ");
-            startedFilter = true;
-        }
-        try wi.writeAll("c.kname = $");
-        try wi.writeAll(&std.fmt.digits2(filterIndex));
-        filterIndex += 1;
-    }
-
-    if (hasHostFilter) {
-        if (startedFilter) {
-            try wi.writeAll(" and ");
-        } else {
-            try wi.writeAll(" where ");
-            startedFilter = true;
-        }
-        try wi.writeAll("c.host = $");
-        try wi.writeAll(&std.fmt.digits2(filterIndex));
-        filterIndex += 1;
-    }
-
-    try wi.writeAll(base_end);
-    try wi.flush();
-    const query = try writer.toOwnedSlice();
-    defer allocator.free(query);
-
-    var stmt = try pg.Stmt.init(self.conn, .{ .allocator = allocator, .column_names = true });
-    errdefer stmt.deinit();
-
-    try stmt.prepare(query, null);
-    try stmt.bind(eq.drop);
-    try stmt.bind(eq.take);
 
     if (hasEventTypeFilter) {
         try stmt.bind(eq.event_types.?);
@@ -174,6 +148,99 @@ pub fn get(self: *KEventRepo, allocator: std.mem.Allocator, eq: models.Paginated
     if (hasHostFilter) {
         try stmt.bind(eq.hosts.?);
     }
+}
+
+fn buildEventFilterQuery(
+    writer: *std.io.Writer,
+    eq: models.PaginatedEventsQuery,
+    start: []const u8,
+    end: []const u8,
+    filterIndexStart: u8,
+) !void {
+    try writer.writeAll(start);
+    const hasEventTypeFilter = eq.event_types != null and !std.mem.eql(u8, eq.event_types.?, "All");
+    const hasClientFilter = eq.clients != null and !std.mem.eql(u8, eq.clients.?, "All");
+    const hasHostFilter = eq.hosts != null and !std.mem.eql(u8, eq.hosts.?, "All");
+    if (hasClientFilter or hasHostFilter) {
+        try writer.writeAll(" join kclient c ON e.kclient = c.id ");
+    }
+
+    var startedFilter = false;
+    var filterIndex: u8 = filterIndexStart;
+
+    if (hasEventTypeFilter) {
+        if (startedFilter) {
+            try writer.writeAll(" and ");
+        } else {
+            try writer.writeAll(" where ");
+            startedFilter = true;
+        }
+        try writer.writeAll("e.event_type = $");
+        try writer.writeAll(&std.fmt.digits2(filterIndex));
+        filterIndex += 1;
+    }
+
+    if (hasClientFilter) {
+        if (startedFilter) {
+            try writer.writeAll(" and ");
+        } else {
+            try writer.writeAll(" where ");
+            startedFilter = true;
+        }
+        try writer.writeAll("c.kname = $");
+        try writer.writeAll(&std.fmt.digits2(filterIndex));
+        filterIndex += 1;
+    }
+
+    if (hasHostFilter) {
+        if (startedFilter) {
+            try writer.writeAll(" and ");
+        } else {
+            try writer.writeAll(" where ");
+            startedFilter = true;
+        }
+        try writer.writeAll("c.host = $");
+        try writer.writeAll(&std.fmt.digits2(filterIndex));
+        filterIndex += 1;
+    }
+
+    try writer.writeAll(end);
+    try writer.flush();
+}
+
+pub fn get(self: *KEventRepo, allocator: std.mem.Allocator, eq: models.PaginatedEventsQuery) !std.ArrayListUnmanaged(KEventRow) {
+    var writer = std.io.Writer.Allocating.init(allocator);
+    const wi = &writer.writer;
+
+    const base_query = "select e.* from kevent e";
+    const base_end =
+        \\    order by e.end_time DESC
+        \\    limit $2
+        \\    offset $1;
+    ;
+
+    try buildEventFilterQuery(
+        wi,
+        eq,
+        base_query,
+        base_end,
+        3,
+    );
+
+    const query = try writer.toOwnedSlice();
+    defer allocator.free(query);
+
+    var stmt = try pg.Stmt.init(
+        self.conn,
+        .{ .allocator = allocator, .column_names = true },
+    );
+    errdefer stmt.deinit();
+
+    try stmt.prepare(query, null);
+    try stmt.bind(eq.drop);
+    try stmt.bind(eq.take);
+
+    try bindEventFilterQueryParams(&stmt, eq);
 
     const result = stmt.execute() catch |e| switch (e) {
         error.PG => {

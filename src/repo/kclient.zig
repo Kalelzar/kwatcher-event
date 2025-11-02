@@ -4,6 +4,8 @@ const pg = @import("pg");
 const uuid = @import("uuid");
 const kwatcher = @import("kwatcher");
 
+const models = @import("../models.zig");
+
 const KClientRepo = @This();
 
 conn: *pg.Conn,
@@ -85,12 +87,51 @@ pub fn getOrCreate(self: *KClientRepo, arena: *kwatcher.mem.InternalArena, clien
     }
 }
 
-pub fn getClients(self: *KClientRepo, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
-    const result = self.conn.queryOpts(
-        "select distinct kname from kclient order by kname",
-        .{},
+pub fn getClients(self: *KClientRepo, allocator: std.mem.Allocator, ef: models.EventFilters) !std.ArrayList([]const u8) {
+    const start = "select distinct kname from kclient c ";
+    const end = " order by kname";
+
+    var writer = std.io.Writer.Allocating.init(allocator);
+    const wi = &writer.writer;
+
+    var eq = ef;
+    eq.clients = null;
+
+    try buildEventFilterQuery(
+        wi,
+        eq,
+        start,
+        end,
+        1,
+    );
+
+    const query = try writer.toOwnedSlice();
+    defer allocator.free(query);
+
+    var stmt = try pg.Stmt.init(
+        self.conn,
         .{ .allocator = allocator },
-    ) catch |e| switch (e) {
+    );
+    errdefer stmt.deinit();
+
+    stmt.prepare(query, null) catch |e| switch (e) {
+        error.PG => {
+            if (self.conn.err) |pge| {
+                log.err(
+                    "[{s}] Encountered an error ({s}) while preparing client query: \n{s}\n",
+                    .{ pge.severity, pge.code, pge.message },
+                );
+            } else {
+                log.err("Encountered an unknown error while preparing client query.\n", .{});
+            }
+            return e;
+        },
+        else => return e,
+    };
+
+    try bindEventFilterQueryParams(&stmt, eq);
+
+    const result = stmt.execute() catch |e| switch (e) {
         error.PG => {
             if (self.conn.err) |pge| {
                 log.err(
@@ -115,12 +156,55 @@ pub fn getClients(self: *KClientRepo, allocator: std.mem.Allocator) !std.ArrayLi
     return clients;
 }
 
-pub fn getHosts(self: *KClientRepo, allocator: std.mem.Allocator) !std.ArrayList([]const u8) {
-    const result = self.conn.queryOpts(
-        "select distinct host from kclient order by host",
-        .{},
+pub fn getHosts(
+    self: *KClientRepo,
+    allocator: std.mem.Allocator,
+    ef: models.EventFilters,
+) !std.ArrayList([]const u8) {
+    const start = "select distinct host from kclient c ";
+    const end = " order by host";
+
+    var writer = std.io.Writer.Allocating.init(allocator);
+    const wi = &writer.writer;
+
+    var eq = ef;
+    eq.hosts = null;
+
+    try buildEventFilterQuery(
+        wi,
+        eq,
+        start,
+        end,
+        1,
+    );
+
+    const query = try writer.toOwnedSlice();
+    defer allocator.free(query);
+
+    var stmt = try pg.Stmt.init(
+        self.conn,
         .{ .allocator = allocator },
-    ) catch |e| switch (e) {
+    );
+    errdefer stmt.deinit();
+
+    stmt.prepare(query, null) catch |e| switch (e) {
+        error.PG => {
+            if (self.conn.err) |pge| {
+                log.err(
+                    "[{s}] Encountered an error ({s}) while preparing client query: \n{s}\n",
+                    .{ pge.severity, pge.code, pge.message },
+                );
+            } else {
+                log.err("Encountered an unknown error while preparing client query.\n", .{});
+            }
+            return e;
+        },
+        else => return e,
+    };
+
+    try bindEventFilterQueryParams(&stmt, eq);
+
+    const result = stmt.execute() catch |e| switch (e) {
         error.PG => {
             if (self.conn.err) |pge| {
                 log.err(
@@ -143,4 +227,80 @@ pub fn getHosts(self: *KClientRepo, allocator: std.mem.Allocator) !std.ArrayList
     }
 
     return clients;
+}
+
+fn buildEventFilterQuery(
+    writer: *std.io.Writer,
+    eq: models.EventFilters,
+    start: []const u8,
+    end: []const u8,
+    filterIndexStart: u8,
+) !void {
+    try writer.writeAll(start);
+    const hasEventTypeFilter = eq.event_types != null and !std.mem.eql(u8, eq.event_types.?, "All");
+    const hasClientFilter = eq.clients != null and !std.mem.eql(u8, eq.clients.?, "All");
+    const hasHostFilter = eq.hosts != null and !std.mem.eql(u8, eq.hosts.?, "All");
+    if (hasEventTypeFilter) {
+        try writer.writeAll(" join kevent e ON c.id = e.kclient");
+    }
+
+    var startedFilter = false;
+    var filterIndex: u8 = filterIndexStart;
+
+    if (hasEventTypeFilter) {
+        if (startedFilter) {
+            try writer.writeAll(" and ");
+        } else {
+            try writer.writeAll(" where ");
+            startedFilter = true;
+        }
+        try writer.writeAll("e.event_type = $");
+        try writer.writeAll(&std.fmt.digits2(filterIndex));
+        filterIndex += 1;
+    }
+
+    if (hasClientFilter) {
+        if (startedFilter) {
+            try writer.writeAll(" and ");
+        } else {
+            try writer.writeAll(" where ");
+            startedFilter = true;
+        }
+        try writer.writeAll("c.kname = $");
+        try writer.writeAll(&std.fmt.digits2(filterIndex));
+        filterIndex += 1;
+    }
+
+    if (hasHostFilter) {
+        if (startedFilter) {
+            try writer.writeAll(" and ");
+        } else {
+            try writer.writeAll(" where ");
+            startedFilter = true;
+        }
+        try writer.writeAll("c.host = $");
+        try writer.writeAll(&std.fmt.digits2(filterIndex));
+        filterIndex += 1;
+    }
+
+    try writer.writeAll(end);
+    try writer.flush();
+}
+
+fn bindEventFilterQueryParams(stmt: *pg.Stmt, eq: models.EventFilters) !void {
+    const hasEventTypeFilter = eq.event_types != null and !std.mem.eql(u8, eq.event_types.?, "All");
+    const hasClientFilter = eq.clients != null and !std.mem.eql(u8, eq.clients.?, "All");
+    const hasHostFilter = eq.hosts != null and !std.mem.eql(u8, eq.hosts.?, "All");
+
+    if (hasEventTypeFilter) {
+        try stmt.bind(eq.event_types.?);
+    }
+
+    if (hasClientFilter) {
+        try stmt.bind(eq.clients.?);
+    }
+
+    if (hasHostFilter) {
+        try stmt.bind(eq.hosts.?);
+    }
 }
